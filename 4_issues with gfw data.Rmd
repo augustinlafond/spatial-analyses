@@ -1,0 +1,225 @@
+---
+title: "Issues with Global Fishing Watch data"
+author: "Augustin Lafond"
+date: "2024-11-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+``` 
+
+This Rmarkdown describes two main issues we identified while working with global fishing watch data, which we present here in the form of examples. 
+
+1) For a given year and vessel, we have identified significant differences in the total apparent fishing effort estimated through the get_event and get_raster functions. Although the format of these data is different, we would have expected to find similar values when summing all events or grided data. How then can we explain such discrepancies?
+
+2) For a given year and vessel, we have noticed significant differences in the apparent fishing effort estimated from API version 3 and version 2. We are aware that there may be differences between the two versions of the API, but we were nevertheless surprised by the extent of these variations. 
+Hence can we reasonably rely on data from API version 2?
+
+This Rmarkdown and questions will be sent to GFW to understand these differences.
+
+To illustrate these points, we will focus in the following on 64 French vessels that were dismantled in 2023 as part of a Brexit exit plan to help shipowners affected by the UK's exit from the European Union. We focus on Global Fishing Watch data for the year 2020. 
+
+```{r}
+
+source("scripts/load_packages.R")
+
+load_packages("tidyverse",
+              "janitor", 
+              "readxl",
+              "gfwr",
+              "foreach",
+              "openxlsx", 
+              "kableExtra",
+              "sf")
+
+```
+
+We're importing the list of French ships that have received subsidies to be dismantled as part of the Brexit fleet exit plan, which aims to compensate shipowners who have been heavily impacted by the UK's withdrawal from the European Union. This vessel list will serve as a basis for comparing Global Fishing Wach data. 
+
+```{r}
+
+pai_brexit <- read.xlsx("data/Liste des bénéficiaires finaux PAI - 86 navires-3_1.xlsx") %>%
+  row_to_names (2) %>%
+  clean_names () %>%
+  mutate_at(vars(matches("date")), ~as.Date(as.numeric(.), origin = "1899-12-30")) %>%
+  mutate_at(vars(matches("montant")), ~gsub(" |€", "", .)) %>%
+  mutate_at(vars(matches("montant")), ~as.numeric(str_replace(., ",", "."))) %>%
+  mutate(numero_cfr = toupper(numero_cfr),
+         numero_cfr = str_replace(numero_cfr, "^(FR)(A)?(0){2,5}([0-9]{6})", "FRA000\\4"),
+         numero_cfr = ifelse(numero_cfr == "FRA0005288889", "FRA000528889", numero_cfr)) %>%
+  rename(cfr = "numero_cfr",
+         debut_operation = "date_previsionnelle_debut_doperation",
+         fin_operation = "date_previsionnelle_fin_doperation", 
+         code_postal = "code_postal_de_loperation",
+         beneficiaire = "code_nature_beneficiaire_p_m",
+         numero_dossier = "numero_de_dossier_initial", 
+         intitule_operation = "intitule_de_loperation",
+         description_operation = "description_de_loperation",
+         depenses_eligibles = "montant_total_depenses_eligibles",
+         montant_aide_publique  = "montant_de_laide_publique") %>%
+  select(-montant_au_titre_du_regime_daide_sa_104347, -immatriculation_navire) %>%
+  left_join(readRDS(url("https://www.dropbox.com/scl/fi/cum69eazhft2zbfhgqi7w/clean_fleet_register_20230626.rds?rlkey=5zt0vxw964qjixvxhtjqmvldy&dl=1")) %>%
+  filter(country == "FRA" & ymd("2022-11-18") %within% interval(event_start_date, event_end_date)), by = "cfr") #We merge the vessel list with the fleet register database to get vessel' characteristics, in particular the MMSI (which will be used to access Global Fishing Watch data) 
+# 2022-11-18 is the application deadline for the fleet exit plan
+
+```
+
+# Comparison between fishing effort estimated through the get_raster function vs. through the get_event function
+
+We download fishing events and calculate for each vessel the sum of apparent fishing hours for the year 2020.
+
+```{r}
+
+#create a vector with vessel mmsi  
+vessel_id <- pai_brexit %>%
+  distinct(mmsi) %>%
+  filter(!is.na(mmsi)) %>%
+  mutate(gfw_id = NA)
+
+#download GFW vessel ids
+
+for (i in 1:nrow(vessel_id)) {
+  id <- get_vessel_info(
+    query = vessel_id[i, 1],
+    search_type = "search",
+    key = gfw_auth())
+  
+  if (!is.null(id)) {
+    vessel_id [i, 2] <- paste(id$selfReportedInfo %>% 
+                                select(id = vesselId, mmsi = ssvid, shipname) %>%
+                                filter (mmsi == vessel_id %>% slice(i) %>% pull(mmsi) & !is.na(shipname)) %>% # in some cases the mmsi found is different from the one indicated in the search
+                                pull (id), collapse = ",")
+  }
+  else if (is.null(id)) {
+    vessel_id [i, 2] <- NA
+  }
+}
+
+
+#download gfw fishing events
+
+vessel_id <- unlist(strsplit(vessel_id %>% filter(!is.na(gfw_id)) %>% pull(gfw_id), ","))
+
+fishing_events_data <- foreach(i=1:length(vessel_id)) %do% {
+  get_event(event_type = 'FISHING',
+            vessels = vessel_id[i],
+            start_date = ymd("2020-01-01"),
+            end_date = ymd("2020-12-31"),
+            key = gfw_auth())
+}
+
+fishing_events_data <- fishing_events_data %>%
+  bind_rows() %>%
+  mutate(id = 1 : n()) %>%
+  with_groups(id, mutate, mmsi =  unlist(map(vessel, 3))[1]) %>%
+  rowwise () %>%
+  mutate(apparent_fishing_hours_events = as.numeric(difftime(end, start, units = "hours"))) %>%
+  ungroup () 
+
+rm(id)
+
+```
+
+We download raster data and calculate for each vessel the sum of apparent fishing hours for the year 2020.
+
+```{r}
+
+region <- st_read(dsn = "data/shapefiles/FAO_AREAS_CWP_NOCOASTLINE", layer = "FAO_AREAS_CWP_NOCOASTLINE") %>%
+    filter(., F_LEVEL == "MAJOR")%>%
+    select(-c("NAME_FR","NAME_ES"))%>%
+    st_as_sf(., crs = 4326)%>%
+    select(-c("F_LEVEL", "SUBOCEAN","F_SUBAREA","F_DIVISION","F_SUBDIVIS","F_SUBUNIT")) %>%
+    filter(F_AREA == 27)
+
+
+raster_data <- get_raster(
+  spatial_resolution = 'LOW',
+  temporal_resolution = 'YEARLY',
+  group_by = 'VESSEL_ID',
+  start_date = "2020-01-01",
+  end_date = "2020-12-31",
+  filter_by = "flag in ('FRA')",
+  region = region,
+  region_source = 'USER_SHAPEFILE',
+  key = gfw_auth()
+  )
+
+raster_data <- raster_data %>%
+  bind_rows () %>%
+  clean_names () %>%
+  filter(mmsi %in% c(pai_brexit %>%
+                       distinct(mmsi) %>%
+                       filter(!is.na(mmsi)) %>%
+                       pull(mmsi)))
+  
+```
+
+We compare the total fishing effort for the year 2020 obtained from get_raster data and fishing event data
+
+```{r}
+
+raster_event_comparison <- fishing_events_data %>%
+  with_groups(mmsi, summarise, apparent_fishing_hours_events = sum(apparent_fishing_hours_events, na.rm = T)) %>%
+    left_join(raster_data %>% 
+                with_groups(mmsi, summarise, apparent_fishing_hours_raster = sum(apparent_fishing_hours, na.rm = T)) %>%
+                mutate(mmsi = as.character(mmsi))) %>%
+    mutate(time_diff = apparent_fishing_hours_raster - apparent_fishing_hours_events,
+           event_hours_as_percentage_of_raster_hours = round(apparent_fishing_hours_events*100/apparent_fishing_hours_raster,1))
+
+
+raster_event_comparison %>%
+  kable () %>%
+  kable_paper(full_width = T) 
+
+```
+
+There are very significant differences in fishing time estimates between get_raster and get_event data. 
+
+Apparent fishing effort estimated through fishing events is systematically lower than apparent fishing effort estimated through raster data (effort estimated via events = `r raster_event_comparison %>% summarise(mean = round(mean(event_hours_as_percentage_of_raster_hours),1)) %>% pull (mean)` ± `r raster_event_comparison %>% summarise(sd = round(sd(event_hours_as_percentage_of_raster_hours),1)) %>% pull (sd)`% effort estimated via raster).
+
+How to explain these differences ? 
+
+# Comparison between raster data extracted from the V2 vs. the V3 GFW API
+
+```{r}
+
+url_v3 <- "https://www.dropbox.com/scl/fi/i3wgq38n7tq5zz8bh528w/v3.0.zip?rlkey=v75qazi6oljxc4t1w1z5imic2&dl=1"
+url_v2 <- ""
+temp_dir <- tempdir()
+data_file_v3 <- file.path(temp_dir, "v3_data.zip")
+data_file_v2 <- file.path(temp_dir, "v2_data.zip")
+download.file(url_v3, destfile = data_file_v3)
+download.file(url_v2, destfile = data_file_v2)
+unzip(data_file_v3, exdir = temp_dir)
+unzip(data_file_v2, exdir = temp_dir)
+
+# we load raster data we manually downloaded from the GFW platform
+
+raster_v3_v2_comparison <- lapply(paste0(temp_dir, "/v3.0/", list.files(paste0(temp_dir, "/v3.0/")), "/layer-activity-data-0/public-global-fishing-effort-v3.0.csv"), read.csv) %>% ## data from the V3 API
+  bind_rows () %>%
+  clean_names () %>%
+  filter (mmsi %in% c(pai_brexit %>% distinct (mmsi) %>% pull (mmsi))) %>%
+  with_groups(mmsi, summarise, apparent_fishing_hours_raster_v3 = sum(apparent_fishing_hours, na.rm = T)) %>%
+  left_join(lapply(paste0(temp_dir, "/v20231026/", list.files(paste0(temp_dir, "/v20231026/")), "/layer-activity-data-0/public-global-fishing-effort-v20231026.csv"), read.csv) %>%# data from the V2 API
+              bind_rows () %>%
+              clean_names () %>%
+              filter (mmsi %in% c(pai_brexit %>% distinct (mmsi) %>% pull (mmsi)) & time_range == 2020) %>%
+              with_groups(mmsi, summarise, apparent_fishing_hours_raster_v2 = sum(apparent_fishing_hours, na.rm = T))) %>%
+  arrange(desc(apparent_fishing_hours_raster_v2)) %>%
+  mutate(raster_v3_as_percentage_of_raster_v2 = apparent_fishing_hours_raster_v3*100/apparent_fishing_hours_raster_v2)
+
+
+raster_v3_v2_comparison %>%
+  kable () %>%
+  kable_paper(full_width = T) 
+
+rm(url_v2, url_v3, temp_dir, data_file_v2, data_file_v3)
+
+```
+
+There are significant differences between raster data in API version 2 and version 3. 
+
+Apparent fishing hours estimated based on the API V3 is systematically lower than apparent fishing hours estimated based on the API V2 (apparent fishing hours from API V3 = `r raster_v3_v2_comparison %>% summarise(mean = round(mean(raster_v3_as_percentage_of_raster_v2),1)) %>% pull (mean)` ± `r raster_v3_v2_comparison %>% summarise(sd = round(sd(raster_v3_as_percentage_of_raster_v2),1)) %>% pull (sd)`% apparent fishing hours from API V2).
+
+How to explain these differences ? 

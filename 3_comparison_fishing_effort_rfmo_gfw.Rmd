@@ -1,0 +1,250 @@
+---
+title: "Comparison between catch data provided by RFMOs and Global Fishing Watch"
+author: "Augustin Lafond"
+date: "28/10/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r, echo = F}
+
+source("scripts/load_packages.R") #Load packages
+
+load_packages("lubridate",
+              "tidyverse",
+              "readxl",
+              "openxlsx",
+              "janitor",
+              "vroom",
+              "sf",
+              "rnaturalearth", 
+              "gfwr", 
+              "cowplot",
+              "mapview",
+              "foreach")
+
+
+# Import shapefiles on exclusive economic zones
+url <- "https://www.dropbox.com/scl/fo/99nqe5od6hlc4urug5dmt/ANSFN9m2wHBuVvQOs3O1Lgg?rlkey=ni426isn7pgs4jt9x9nn9u1qn&dl=1"
+temp_dir <- tempdir()
+eez_file <- file.path(temp_dir, "eez_shapefiles.zip")
+download.file(url, destfile = eez_file)
+unzip(eez_file, exdir = temp_dir)
+
+eez <- st_read(dsn = temp_dir, layer = "eez_v11", quiet = T) %>%
+  clean_names () %>%
+  filter (mrgid %in% pull(read.xlsx("https://www.dropbox.com/s/c69l6v2fn6ljg5c/eez_id.xlsx?dl=1") %>% 
+                               filter(ocean %in% c("Indian Ocean", "Atlantic Ocean")) %>%
+                               select(eez_id) %>% 
+                            distinct ()))
+
+# we import a file listing European tuna purse seiners with a licence to fish in southern countries
+list_of_authorisations <- read.xlsx("https://www.dropbox.com/s/i04wmdn0criseov/List%20of%20authorizations.xlsx?dl=1") %>%
+  mutate_at (.vars = c("date_start", "date_end"), ~as.Date (., origin = "1899-12-30"))
+  
+key <- Sys.getenv("GFW_TOKEN")
+
+rm(url, temp_dir, eez_file)           
+```
+
+Get the list of European purse seiners which got fishing access agreement during the 2018-2020 period. 
+
+```{r}
+
+vessel_id <- list_of_authorisations %>% 
+    filter (vessel_category == "Purse seiners" & int_overlaps(interval(date_start, date_end), interval(ymd("2018-01-01"), ymd("2020-12-31")))) %>%
+    select (mmsi) %>%
+    distinct () %>% 
+  mutate(gfw_id = NA)
+
+```
+
+```{r}
+#download GFW vessel ids
+for (i in 1:nrow(vessel_id)) {
+  id <- get_vessel_info(
+    query = vessel_id[i, 1],
+    search_type = "search",
+    key = key) 
+  
+  if (!is.null(id)) {
+    vessel_id [i, 2] <- paste(id$selfReportedInfo %>% 
+                                select(id = vesselId, mmsi = ssvid, shipname) %>%
+                                filter (mmsi == vessel_id %>% slice(i) %>% pull(mmsi) & !is.na(shipname)) %>% # in some cases the mmsi found is different from the one indicated in the search
+                                pull (id), collapse = ",")
+  }
+  else {
+    vessel_id [i, 2] <- NA
+  }
+}
+
+rm(id)
+
+vessel_id <- vessel_id %>%
+  mutate (gfw_id = ifelse (gfw_id == "", NA, gfw_id))
+
+#download gfw fishing events
+vessel_id <- unlist(strsplit(vessel_id %>% filter(!is.na(gfw_id)) %>% pull(gfw_id), ","))
+
+data_ps_ue <- foreach(i=1:length(vessel_id)) %do% 
+  get_event(event_type = 'FISHING',
+            vessels = vessel_id[i],
+            start_date = "2018-01-01",
+            end_date = "2020-12-31",
+            key = key)
+
+data_ps_ue <- data_ps_ue %>%
+    bind_rows() %>%
+    mutate(id = 1 : n()) %>%
+    with_groups(id, mutate, vessel_flag = unlist(map(vessel, 4))[1],
+                vessel_name = unlist(map(vessel, 2))[1],
+                vessel_mmsi =  unlist(map(vessel, 3))[1]) %>%
+  mutate (fishing_effort = as.numeric(difftime(end, start, units = "hours")))
+
+```
+
+We want to summarise the fishing effort on grid cells. The same grid will be used to plot ICCAT/IOTC fishing effort data. 
+
+```{r}
+
+bbox_gfw <- st_bbox(c(xmin = floor(data_ps_ue %>% filter (lon == min(lon)) %>% distinct (lon) %>% pull ()), 
+                      xmax = ceiling (data_ps_ue %>% filter (lon == max (lon)) %>% distinct (lon) %>% pull ()), 
+                      ymin = floor(data_ps_ue %>% filter (lat == min (lat)) %>% distinct (lat) %>% pull ()),
+                      ymax = ceiling(data_ps_ue %>% filter (lat == max (lat)) %>% distinct (lat) %>% pull ())),  
+                    crs = st_crs(4326))
+
+data_ps_ue_gridded <- st_as_sf(st_make_grid(st_as_sfc(bbox_gfw),
+                                            what = "polygons", 
+                                            cellsize = 1)) %>%
+  st_join(data_ps_ue %>%
+            st_as_sf(coords = c("lon", "lat"), crs = 4326)) %>% 
+  mutate(geometry_id = as.character (x)) %>%
+  with_groups (geometry_id, summarise, fishing_effort = sum(fishing_effort, na.rm = T)) %>%
+  select (-geometry_id)
+
+```
+
+Load the ICCAT and CTOI data
+
+```{r}
+
+data_iccat_iotc <- readRDS ("data/iccat_spatial.rds") %>%
+  select (country, country_fr, year, month = time_period_id, res = geo_strata_code, lat = y_lat, lon = x_lon, effort = eff1, effort_units = eff1type, fad_associated, ocean, gear, catch, species, species_fr, species_lat, eez, fao_area) %>% 
+  mutate_at (.vars = c("month", "lat", "lon", "effort"), ~as.numeric (.)) %>%
+  bind_rows (data_iotc <- readRDS ("data/iotc_spatial.rds") %>% 
+               select (country, country_fr, year, month, res, lat, lon, effort, effort_units, fad_associated, ocean, gear, catch, species, species_fr, species_lat, eez, fao_area)) %>%
+  filter (effort > 0)
+               
+
+```
+
+```{r}
+
+data_iccat_iotc_ps_ue <- data_iccat_iotc %>%
+  filter (gear %in% c ("Purse seine", "Beach seine", "Small purse seine") & country %in% c("Spain", "France", "Italy")) %>%
+  mutate (effort = ifelse(effort_units %in% c("FDAYS", "DAYS"), effort * 24, effort),
+          effort_units = ifelse(effort_units %in% c("FISH.HOUR", "FHOURS", "FDAYS", "DAYS"), "Hours", effort_units)) %>%
+  filter (!effort_units == "SETS") %>%
+  rename (fishing_effort = effort) %>%
+  filter (year > 2017)
+
+```
+
+We want to summarise the fishing effort on grid cells. We use the same grid as the one used for GFW data. 
+
+```{r}
+
+data_iccat_iotc_ps_ue_gridded <- st_as_sf(st_make_grid(st_as_sfc(bbox_gfw),
+                                            what = "polygons", 
+                                            cellsize = 1)) %>%
+  st_join(data_iccat_iotc_ps_ue %>%
+            st_as_sf(coords = c("lon", "lat"), crs = 4326)) %>% 
+  filter(!is.na(fishing_effort)) %>%
+  mutate(geometry_id = as.character (x)) %>%
+  with_groups (geometry_id, summarise, fishing_effort = sum(fishing_effort, na.rm = T)) %>%
+  select (-geometry_id)
+
+```
+
+We compare both GFW and IOTC/ICCAT fishing effort on the same grid 
+
+These results show that Global Fishing Watch data significantly underestimate the fishing effort of European tuna seiners, particularly in the Indian Ocean. This is because these vessels frequently switch off their AIS transponders.
+
+```{r}
+
+data_plot <- data_iccat_iotc_ps_ue_gridded %>%
+  st_join (data_ps_ue_gridded, join = st_equals) %>%
+  rename (fishing_effort_rfmo = fishing_effort.x, 
+          fishing_effort_gfw = fishing_effort.y) %>%
+  bind_rows(data_ps_ue_gridded %>%
+  st_join (data_iccat_iotc_ps_ue_gridded, join = st_equals) %>% #st_join only do a left join, this why we do two simultaneous st_join to keep grid cells appearing only in data_ps_ie_gridded and data_iccat_iotc_ps_ue_gridded
+   rename (fishing_effort_gfw = fishing_effort.x, 
+          fishing_effort_rfmo = fishing_effort.y)) %>%
+  distinct () %>%
+  mutate (ratio = ifelse (!is.na(fishing_effort_rfmo) & !is.na(fishing_effort_gfw), round((fishing_effort_gfw * 100)/fishing_effort_rfmo, 1), NA),
+          ratio = ifelse(ratio > 100, 100, ratio)) %>%
+  select (geometry = x, fishing_effort_rfmo, fishing_effort_gfw, ratio)
+
+```
+
+Let's make three plots : the first one represent the fishing effort via IOTC/ICCAT data, the second one represent the fishing effort via GFW data, and the third one is the ratio between the fishing effort from GFW and IOTC/ICCAT data. 
+
+```{r}
+sf_use_s2(FALSE)
+
+eez_simplify <- eez %>%
+    st_transform (3395) %>%
+    st_simplify (dTolerance = 10000, preserveTopology = T) %>%
+    st_transform(4326)
+
+p1 <- ggplot () +
+  geom_sf (data = data_plot %>% filter (!is.na (fishing_effort_rfmo)), aes (fill = fishing_effort_rfmo), lwd = 0) +
+  geom_sf (data = ne_countries (continent = "africa", returnclass =  "sf")) + 
+  geom_sf (data = eez_simplify %>%
+             filter (!territory1 %in% c("Brazil", "Portugal", "Iran")), alpha = 0, color = "grey10") +
+  coord_sf (xlim = c(-37, 82), ylim = c(-36, 34)) +
+  scale_fill_viridis_c(trans = scales::pseudo_log_trans(sigma = 500), option = "plasma") +
+  labs (x = "Longitude", y = "Latitude", fill = "Fishing hours\n(IOTC/ICCAT)") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black")) 
+
+p2 <- ggplot () +
+  geom_sf (data = data_plot %>% filter (!is.na (fishing_effort_gfw) & fishing_effort_gfw != 0), aes (fill = fishing_effort_gfw), lwd = 0) +
+  geom_sf (data = ne_countries (continent = "africa", returnclass =  "sf")) + 
+  geom_sf (data = eez_simplify %>%
+             filter (!territory1 %in% c("Brazil", "Portugal", "Iran")), alpha = 0, color = "grey10") +
+  coord_sf (xlim = c(-37, 82), ylim = c(-36, 34)) +
+  scale_fill_viridis_c(trans = scales::pseudo_log_trans(sigma = 100), option = "plasma") +
+  labs (x = "Longitude", y = "Latitude", fill = "Apparent fishing hours\n(GFW)") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black")) 
+
+p3 <- ggplot () +
+  geom_sf (data = data_plot %>% filter(!is.na(ratio)), aes (fill = ratio), lwd = 0) +
+  geom_sf (data = ne_countries (continent = "africa", returnclass =  "sf")) + 
+  geom_sf (data = eez_simplify %>%
+             filter (!territory1 %in% c("Brazil", "Portugal", "Iran")), alpha = 0, color = "grey10") +
+  coord_sf (xlim = c(-37, 82), ylim = c(-36, 34)) +
+  scale_fill_viridis_c(option = "plasma", begin = 0.1) +
+  labs (x = "Longitude", y = "Latitude", fill = "Ratio between GFW\nand IOTC/ICCAT data\n(%)") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black")) 
+
+plot_grid(p1, p2, p3, ncol = 1, align = "v", axis = "lr") 
+
+ggsave(file = "output/comparison_rfmo_gfw/Comparison between catch data provided by RFMOs and Global Fishing Watc.png", width = 210, height = 297, unit = "mm", limitsize = FALSE)
+
+```
+
+

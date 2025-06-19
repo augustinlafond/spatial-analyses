@@ -1,0 +1,428 @@
+---
+title: "Application of models of organic carbon remineralization with depth and carbon sequestration over a 100-year period to estimate carbon not sequestered by the ocean due to fishing."
+author: "Augustin Lafond"
+date: "2025-02-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = F}
+
+source("scripts/load_packages.R") #Load packages
+source("scripts/mean_ipsl_gfdl_models.R")
+source("scripts/mean_temp_fao_zones.R")
+
+load_packages("lubridate",
+              "tidyverse",
+              "readxl",
+              "openxlsx",
+              "janitor",
+              "ncdf4",
+              "reshape2",
+              "foreach", 
+              "sf",
+              "terra",
+              "mapview",
+              "stringr",
+              "kableExtra",
+              "httr")
+
+devtools::install_github("ropensci/rnaturalearth")
+library(rnaturalearth)
+
+```
+
+# Analysis of circulation data from the Ocean Circulation Inverse Model (OCIM). 
+
+These data enabled us to calculate the amount of organic carbon that would have been sequestered (i.e., trapped by the ocean for at least 100 years) in the absence of fishing for each FAO area.
+[Data were downloaded here](https://figshare.com/articles/dataset/AIBECS-OCIM0_1/8317085/3?file=18789281)
+
+Open the file containing the outputs from the OCIM model to extract the variables. Then create a 3D table (latitude x longitude x depth) with the fseq values over a 100-year period (fraction of carbon sequestered for each point in the ocean for at least 100 years).
+
+```{r}
+#download the file
+url <- "https://figshare.com/ndownloader/files/41280609"
+destfile <- tempfile(fileext = ".nc")
+
+r <- GET(url, write_disk(destfile, overwrite = TRUE), timeout(600))
+
+if (status_code(r) == 200) {
+    message("Téléchargement réussi : ", destfile)
+} else {
+    stop("Échec du téléchargement : code HTTP ", status_code(r))
+}
+
+nc_file <- nc_open(destfile)
+
+# Extract variables
+fseq <- ncvar_get(nc_file, "fseq")  # Fraction de carbon (ocean_grid_point, time)
+lat_fseq <- ncvar_get(nc_file, "LAT")  # Latitude (3D)
+lon_fseq <- ncvar_get(nc_file, "LON")  # Longitude (3D)
+depth <- ncvar_get(nc_file, "DEPTH")  # Depth (3D)
+mask <- ncvar_get(nc_file, "MASK")
+
+# Close the file
+nc_close(nc_file)
+
+# Initialize an empty 3D array
+FSEQ_100yr <- array(NA, dim(mask))  # Same dimension as MASK
+
+# Find the index corresponding to 100 years
+# Fill FSEQ_100yr with the values of fseq where MASK == 1 (ocean)# Initialize an empty 3D array
+FSEQ_100yr[mask == 1] <- fseq[, 100]
+
+rm(r, destfile, url)
+```
+
+We create a 2D data frame (latitude x longitude) containing the fseq values at maximum depth for each point in the ocean. This allows us to obtain fseq at the ocean floor (this is what we are interested in, since we are assuming that fish carcasses sink to the bottom).
+
+```{r}
+
+# Find the number of ocean cells at depth for each point (sum of MASK over Z)
+TOPO <- apply(mask, c(1,2), sum)
+
+
+# Initialize a 2D array for the fseq values at the seabed. We also want to know the value of the seabed.
+fseq_bottom_100yr <- matrix(NA, nrow = dim(mask)[1], ncol = dim(mask)[2])
+depth_bottom <- matrix(NA, nrow = dim(mask)[1], ncol = dim(mask)[2])
+
+# Fill in the sequestration values at the deepest layer of each water column.
+for (i in 1:dim(mask)[1]) {
+  for (j in 1:dim(mask)[2]) {
+    if (TOPO[i, j] != 0) {  # Si au moins une couche océanique existe
+      fseq_bottom_100yr[i, j] <- FSEQ_100yr[i, j, TOPO[i, j]]
+      depth_bottom[i,j] <- depth[1,1,TOPO[i, j]]
+    }
+  }
+}
+
+# Map of the fraction of CO₂ sequestered at the bottom (last value of each pixel) after 100 years, focusing on Europe
+df_fseq <- data.frame(
+  longitude = as.vector(lon_fseq[,,1]),
+  latitude = as.vector(lat_fseq[,,1]),
+  fseq_value = as.vector(fseq_bottom_100yr),
+  depth_bottom = as.vector(depth_bottom)
+) %>%
+   mutate(longitude = ifelse(longitude > 180, longitude - 360, longitude))
+
+
+```
+
+A map of this data is created. The fseq values or the maximum depth of each pixel can be printed.
+
+```{r, fig.width=9, fig.height=7}
+
+ggplot() +
+  geom_tile(data = df_fseq %>%
+              filter(longitude >= -20 & longitude <= 15,
+                     latitude >= 30 & latitude <= 65), aes(x = longitude, y = latitude, fill = fseq_value), alpha = 0.8) +
+  geom_sf(data = ne_countries(scale = "medium", returnclass = "sf"), fill = NA, color = "black", size = 0.3) + 
+  scale_fill_viridis_c(option = "magma", na.value = "gray") +
+  coord_sf (xlim = c(-20,15), ylim = c(30, 65)) +
+  theme_minimal() +
+  labs(title = "Fraction of CO₂ remaining sequestered after 100 years at the bottom of the ocean",
+       fill = "Sequestrated fraction")
+
+```
+
+Global map of the fraction of carbon sequestered at the bottom of the ocean. The interactive map allows you to see the pixel values directly by hovering over the pixels with the pointer. 
+
+```{r, fig.width=10, fig.height=8}
+sf_use_s2(FALSE)
+
+# create an sf grid with the same resolution as the OCIM model data
+bbox <- st_bbox(c(xmin = -180, xmax = 180, ymin = -90, ymax = 90), crs = 4326)
+grid_fseq <- st_as_sf(st_make_grid(st_as_sfc(bbox), cellsize = c(2, 1.978022), what = "polygons")) 
+
+fseq_bottom_gridded <- grid_fseq %>%
+  st_join(df_fseq %>%
+            st_as_sf(coords = c("longitude", "latitude"), crs = 4326)) %>%
+  mutate(id = 1: n()) %>%
+  mutate(area_pixel = as.numeric(st_area(.)))
+
+mapview(fseq_bottom_gridded, zcol = "fseq_value", layer.name = "Fraction dof sequestered carbon for at least 100 years")
+
+rm(nc_file, i, j, depth_bottom, fseq_bottom_100yr, TOPO, bbox, fseq)
+
+```
+
+An average fseq is calculated for each FAO zone. The operation is repeated for each type of FAO division (the fseq_fao_zones function was created for this purpose).
+
+```{r}
+# load polygons for FAO zones
+fao_shp <- st_read(dsn = "data/shapefiles/FAO_AREAS_CWP_NOCOASTLINE", layer = "FAO_AREAS_CWP_NOCOASTLINE") %>%
+    clean_names () %>%
+    arrange(f_level) %>%
+    select(f_level, f_code)
+
+# Calculate the intersection between fseq pixels and FAO sub-areas
+fseq_fao_zone <- st_intersection(fseq_bottom_gridded, fao_shp)
+
+# Add a column with the intersection area
+fseq_fao_zone <- fseq_fao_zone %>%
+    mutate(area_intersection = as.numeric(st_area(.))) %>%
+    mutate(coverage_ratio = ifelse(!is.na(fseq_value),area_intersection/area_pixel, NA)) %>%
+    mutate(fseq_weighted = fseq_value * coverage_ratio) %>%
+    with_groups(c("f_level", "f_code"), summarise, fseq_zone = sum(fseq_weighted, na.rm = T)/sum(coverage_ratio, na.rm = T))
+
+write.xlsx(fseq_fao_zone %>%
+             st_drop_geometry(), "output/carbon not sequestered due to fishing/fseq_fao_zone_seq100years.xlsx")
+
+```
+
+A map of the fraction of CO2 sequestered over a 100-year period is produced for each FAO sub-zone. 
+
+```{r, fig.width=10, fig.height=8}
+
+mapview(fseq_fao_zone %>%
+          filter(f_level == "DIVISION" | f_code %in% c("51.1", "51.2", "51.3", "51.4", "51.5", "51.6", "51.7", "51.8")), zcol = "fseq_zone", layer.name = "Fraction dof sequestered carbon for at least 100 years")
+
+```
+
+# Model of organic carbon remineralization with depth
+
+## Analysis of bathymetric data
+
+First, the average depth of each FAO zone must be calculated.
+
+The bathymetric data is loaded.
+
+```{r}
+# Download and open the bathymetric data 
+url <- "https://www.dropbox.com/scl/fi/2t8zbbt1mkqohw5fpshtw/terrain_characteristics_6d78_4f59_9e1f_U1739441840737.nc?rlkey=hafcojq0w26us7ueask7rg8nw&dl=1"
+temp_dir <- tempdir()
+bathy_file <- file.path(temp_dir, "bathy.nc")
+download.file(url, destfile = bathy_file)
+nc_file <- nc_open(bathy_file)
+
+# Extract variables
+bathy <- ncvar_get(nc_file, "bathymetry_mean")  # bathymetry
+lon_bathy <- ncvar_get(nc_file, "longitude")
+lat_bathy <- -ncvar_get(nc_file, "latitude")
+               
+# Close the file
+nc_close(nc_file)
+
+# Create a raster from the extracted NetCDF data
+r_bathy <- rast(nrows = length(lat_bathy), ncols = length(lon_bathy),
+                xmin = min(lon_bathy), xmax = max(lon_bathy),
+                ymin = min(lat_bathy), ymax = max(lat_bathy),
+                vals = as.vector(bathy))
+
+# Assign coordinate reference system (WGS84)
+crs(r_bathy) <- "EPSG:4326"
+
+# Charger le raster (supposons r_bathy déjà défini)
+r_bathy <- flip(r_bathy, direction = "vertical")  # Inverser selon Y (latitude)
+
+# Plot bathymetry raster
+plot(r_bathy, main = "Global Bathymetry Data")
+
+# Handling Missing Values
+r_bathy[r_bathy == -9999.9] <- NA
+
+rm(url, temp_dir, bathy_file)
+```
+
+Convert the raster object to an sf (spatial dataframe) object.
+
+```{r}
+
+# Convert raster to points
+bathy_sf <- as.data.frame(r_bathy, xy = TRUE, na.rm = TRUE)
+
+# Rename columns to be explicit
+colnames(bathy_sf) <- c("lon", "lat", "depth")
+
+# Convert the data frame to an `sf` object
+bathy_sf <- st_as_sf(bathy_sf, coords = c("lon", "lat"), crs = 4326)
+
+```
+
+We calculate mean depth for each FAO area
+
+```{r}
+sf_use_s2(FALSE)
+
+# Harmonize CRS by transforming bathy_sf
+ bathy_sf <- st_transform(bathy_sf, st_crs(fao_shp))
+
+# loading FAO shapefiles
+fao_level <- fao_shp %>%
+    st_drop_geometry() %>%
+    distinct(f_level) %>%
+    pull(f_level)
+
+
+foreach(i=1:length(fao_level)) %do% {
+  fao_mean_depth <- st_join(bathy_sf, fao_shp %>% filter(f_level == fao_level[i])) %>%
+    st_drop_geometry() %>%
+    with_groups(c("f_level", "f_code"), summarise, depth_mean = mean(depth, na.rm = T))
+
+  write.xlsx(fao_mean_depth, paste0("output/carbon not sequestered due to fishing/depth_fao_zone/mean_depth_", fao_level[i], ".xlsx"))
+}
+
+```
+
+The output files associated with each FAO division level are concatenated.
+
+```{r}
+
+mean_depth_fao <- lapply(paste0("output/carbon not sequestered due to fishing/depth_fao_zone/", list.files("output/carbon not sequestered due to fishing/depth_fao_zone/")), read.xlsx) %>%
+  bind_rows () %>%
+  filter(!is.na(f_level))
+
+```
+
+A map of the average depth of FAO zones is produced.
+
+```{r, fig.width=10, fig.height=8}
+
+mapview(fao_shp %>%
+          left_join(mean_depth_fao, by = c("f_level", "f_code")) %>%
+          filter(f_level == "DIVISION" | f_code %in% c("51.1", "51.2", "51.3", "51.4", "51.5", "51.6", "51.7", "51.8")), layer.name = "Mean depth (meters)", zcol = "depth_mean") 
+  
+```
+
+The average depths of the FAO zones are combined with the volumes landed by France in 2022 to determine whether landings take place in deep waters or not.
+
+```{r}
+
+  mean_depth_fao_vs_landings <- read.xlsx("data/catch_data_from_stecf.xlsx", sheet = 1)%>%
+  row_to_names(1) %>%
+  mutate(value = round(as.numeric(value)/10^3,1)) %>%
+  with_groups(sub_reg, summarise, value = sum(value, na.rm = T)) %>%
+  rename(f_code = sub_reg) %>%
+  left_join(mean_depth_fao %>%
+              select(-f_level)) %>%
+  rename(landings = value) %>%
+  arrange(desc(landings)) %>%
+  filter(!is.na(depth_mean))
+
+write.xlsx(mean_depth_fao_vs_landings, "output/carbon not sequestered due to fishing/mean_depth_fao_vs_landings.xlsx")
+
+ mean_depth_fao_vs_landings %>%
+  kable () %>%
+  kable_paper(full_width = T) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "responsive", "hover")) %>%
+  row_spec(0, bold = TRUE)
+
+```
+
+# Application of the carcass remineralization model during their fall in the water column
+
+We begin by processing the output data from the Institut Pierre Simon Laplace (IPSL) and the Geophysical Fluid Dynamics Laboratory (GFDL) models to obtain temperature maps for each layer depth of the ocean.
+
+For each layer, we superimpose the temperature maps from the two models and calculate the “average” map.
+
+```{r}
+
+url <- "https://cloud.leviia.com/s/ZnIz.kDd2C7XGsyctfFt/download"
+temp_dir <- tempdir()
+archive_path <- file.path(temp_dir, "dataset.zip")
+download.file(url, destfile = archive_path, mode = "wb")
+unzip(archive_path, exdir = temp_dir) 
+
+t_0_200 <- mean_ipsl_gfdl_models(paste0(temp_dir, "/temp_h_layers_detrended/GFDL26_0_200m.RData"), paste0(temp_dir, "/temp_h_layers_detrended/IPSL26_0_200m.RData"))
+t_200_500 <- mean_ipsl_gfdl_models(paste0(temp_dir, "/temp_h_layers_detrended/GFDL26_200_500m.RData"), paste0(temp_dir, "/temp_h_layers_detrended/IPSL26_200_500m.RData"))
+t_500_1000 <- mean_ipsl_gfdl_models(paste0(temp_dir, "/temp_h_layers_detrended/GFDL26_500_1000m.RData"), paste0(temp_dir, "/temp_h_layers_detrended/IPSL26_500_1000m.RData"))
+t_1000_2000 <- mean_ipsl_gfdl_models(paste0(temp_dir, "/temp_h_layers_detrended/GFDL26_1000_2000m.RData"), paste0(temp_dir, "/temp_h_layers_detrended/IPSL26_1000_2000m.RData"))
+t_2000_btm <- mean_ipsl_gfdl_models(paste0(temp_dir, "/temp_h_layers_detrended/GFDL26_2000_btm.RData"), paste0(temp_dir, "/temp_h_layers_detrended/IPSL26_2000_btm.RData"))
+
+```
+
+We create maps of these temperature layers.
+
+```{r, fig.width=10, fig.height=8}
+
+mapview(t_0_200, layer.name = "Layer temperature 0-200 (average of IPSL and GFDL models)") +
+  mapview(t_200_500, layer.name = "Layer temperature 200-500 (average of IPSL and GFDL models)") +
+  mapview(t_500_1000, layer.name = "Layer temperature 500-1000 (average of IPSL and GFDL models)") +
+  mapview(t_1000_2000, layer.name = "Layer temperature 1000-2000 (average of IPSL and GFDL models)") +
+  mapview(t_2000_btm, layer.name = "Layer temperature 2000-bottom (average of IPSL and GFDL models)")
+
+```
+
+The average temperature and k remineralization (fraction of carbon remineralized by bacterial activity per day of fall in the water column) are calculated for each layer and each FAO zone.
+
+```{r}
+
+krem_fao_zone <- mean_temp_fao_zones(t_0_200) %>%
+  rename(t_0_200 = t_zone) %>%
+  left_join(mean_temp_fao_zones(t_200_500) %>%
+              rename(t_200_500 = t_zone)) %>%
+  left_join(mean_temp_fao_zones(t_500_1000) %>%
+              rename(t_500_1000 = t_zone)) %>%
+  left_join(mean_temp_fao_zones(t_1000_2000) %>%
+              rename(t_1000_2000 = t_zone)) %>%
+  left_join(mean_temp_fao_zones(t_2000_btm) %>%
+              rename(t_2000_btm = t_zone)) %>%
+  pivot_longer(cols = c("t_0_200", "t_200_500", "t_500_1000", "t_1000_2000", "t_2000_btm"), names_to = "layer", values_to = "mean_temp") %>%
+  mutate(krem = 0.25 * (2^((mean_temp - 10)/10)))
+
+```
+
+Kremineralization maps are produced for each layer.
+
+```{r, fig.width=10, fig.height=8}
+
+mapview(fao_shp %>%
+    left_join(krem_fao_zone, by = c("f_level", "f_code")) %>%
+    filter(f_level == "DIVISION" | f_code %in% c("51.1", "51.2", "51.3", "51.4", "51.5", "51.6", "51.7", "51.8")) %>%
+        filter(layer == "t_0_200"), zcol = "krem", layer.name = "Couche 0-200 mètres", at = seq(0, 0.7, 0.05)) +
+  mapview(fao_shp %>%
+    left_join(krem_fao_zone, by = c("f_level", "f_code")) %>%
+    filter(f_level == "DIVISION" | f_code %in% c("51.1", "51.2", "51.3", "51.4", "51.5", "51.6", "51.7", "51.8")) %>%
+        filter(layer == "t_200_500"), zcol = "krem", layer.name = "Couche 200-500 mètres", at = seq(0, 0.7, 0.05), hide = TRUE, scale = FALSE, legend = FALSE) +
+   mapview(fao_shp %>%
+    left_join(krem_fao_zone, by = c("f_level", "f_code")) %>%
+    filter(f_level == "DIVISION" | f_code %in% c("51.1", "51.2", "51.3", "51.4", "51.5", "51.6", "51.7", "51.8")) %>%
+        filter(layer == "t_500_1000"), zcol = "krem", layer.name = "Couche 500-1000 mètres", at = seq(0, 0.7, 0.05), hide = TRUE, scale = FALSE, legend = FALSE) +
+   mapview(fao_shp %>%
+    left_join(krem_fao_zone, by = c("f_level", "f_code")) %>%
+    filter(f_level == "DIVISION" | f_code %in% c("51.1", "51.2", "51.3", "51.4", "51.5", "51.6", "51.7", "51.8")) %>%
+        filter(layer == "t_1000_2000"), zcol = "krem", layer.name = "Couche 1000-2000 mètres", at = seq(0, 0.7, 0.05), hide = TRUE, scale = FALSE, legend = FALSE) +
+   mapview(fao_shp %>%
+    left_join(krem_fao_zone, by = c("f_level", "f_code")) %>%
+    filter(f_level == "DIVISION" | f_code %in% c("51.1", "51.2", "51.3", "51.4", "51.5", "51.6", "51.7", "51.8")) %>%
+        filter(layer == "t_2000_btm"), zcol = "krem", layer.name = "Couche 2000-fond", at = seq(0, 0.7, 0.05), hide = TRUE, scale = FALSE, legend = FALSE)
+
+```
+
+From the krem, the remineralization model can then be applied to each FAO zone. Kremineralization maps are produced for each layer.
+
+```{r}
+
+carbon_remineralized_layer <- krem_fao_zone %>%
+    select(f_level, f_code, layer, krem) %>%
+    left_join(mean_depth_fao, by = c("f_level", "f_code")) %>%
+    mutate(depth_mean = -depth_mean) %>%
+    mutate(layer_top = str_extract(layer, "(?<=_)[^_]+(?=_)"),
+           layer_bottom = str_extract(layer, "[^_]+$")) %>%
+    mutate(layer_bottom = ifelse(layer_bottom == "btm", 10000, layer_bottom)) %>%
+    mutate_at(.vars = c("layer_top", "layer_bottom"), ~as.numeric (.)) %>%
+    mutate(carbon_remineralized = case_when(depth_mean > layer_bottom ~ 1-(exp((-krem / 1150) * (layer_bottom-layer_top))),
+                                                depth_mean > layer_top & depth_mean < layer_bottom ~ 1-(exp((-krem / 1150) * (depth_mean - layer_top))),
+                                                depth_mean < layer_top ~ NA))
+
+carbon_not_remineralized_fao_zone <- carbon_remineralized_layer %>%
+    with_groups(c("f_level", "f_code"), summarise, fraction_carbon_remineralized = sum(carbon_remineralized, na.rm = T)) %>%
+    mutate(fraction_carbon_not_remineralized = 1 - fraction_carbon_remineralized) %>%
+  select(-fraction_carbon_remineralized) %>%
+  rename(fraction_carbon_escaping_remineralizion = fraction_carbon_not_remineralized)
+
+write.xlsx(carbon_not_remineralized_fao_zone, "output/carbon not sequestered due to fishing/carbon_not_remineralized_fao_zone.xlsx")
+
+```
+
+Map of the fraction of carbon from fish carcasses that escapes remineralization
+
+```{r, fig.width=10, fig.height=8}
+mapview(fao_shp %>%
+    left_join(carbon_not_remineralized_fao_zone) %>%
+        filter(f_level == "DIVISION" | f_code %in% c("51.1", "51.2", "51.3", "51.4", "51.5", "51.6", "51.7", "51.8")), zcol = "fraction_carbon_escaping_remineralizion", layer.name = "Fraction of carbon escaping remineralization")
+```
+
